@@ -1,0 +1,8 @@
+{
+  "name": "Fusion",
+  "version": "0.0.0-vendored",
+  "description": "Vendored xioTechnologies Fusion AHRS source files used by the flight estimator.",
+  "build": {
+    "srcDir": "src"
+  }
+}

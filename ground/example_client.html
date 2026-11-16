@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Flight computer live telemetry (example client)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.4 system-ui, sans-serif; background: #111; color: #ddd; margin: 0; padding: 16px; }
+  h1 { font-size: 16px; margin: 0 0 12px; }
+  .grid { display: grid; grid-template-columns: 240px 1fr 1fr; gap: 16px; align-items: start; }
+  .card { background: #1b1b1b; border: 1px solid #2a2a2a; border-radius: 6px; padding: 12px; }
+  .big { font-size: 28px; font-weight: 600; }
+  .label { color: #888; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .row { display: flex; justify-content: space-between; padding: 2px 0; }
+  .ok { color: #6c6; } .bad { color: #e66; } .warn { color: #ec6; }
+  canvas { width: 100%; height: 140px; background: #141414; border-radius: 4px; }
+  /* quaternion cube: CSS 3D, no libraries */
+  .scene { perspective: 500px; height: 200px; display: grid; place-items: center; }
+  .cube { position: relative; width: 60px; height: 160px; transform-style: preserve-3d; }
+  .face { position: absolute; width: 60px; height: 160px; background: rgba(90,140,220,.35); border: 1px solid #8ab; }
+  .face.top, .face.bottom { height: 60px; }
+  .face.nose { background: rgba(230,90,90,.6); }
+  pre { font-size: 11px; max-height: 260px; overflow: auto; background: #141414; padding: 8px; }
+</style>
+</head>
+<body>
+<h1>Live telemetry — <span id="conn" class="bad">disconnected</span>
+  <small style="color:#888">ws://<span id="host">localhost</span>:8765</small></h1>
+
+<div class="grid">
+  <div class="card">
+    <div class="label">Phase</div><div class="big" id="phase">—</div>
+    <div class="label">Altitude (m)</div><div class="big" id="alt">—</div>
+    <div class="label">Vertical velocity (m/s)</div><div class="big" id="vel">—</div>
+    <div class="label">Flags</div><div id="flags"></div>
+    <div class="label" style="margin-top:8px">Link</div><div id="link"></div>
+  </div>
+
+  <div class="card">
+    <div class="label">Attitude (quaternion, body → ENU)</div>
+    <div class="scene"><div class="cube" id="cube">
+      <div class="face nose" style="transform: rotateY(0deg) translateZ(30px)"></div>
+      <div class="face" style="transform: rotateY(90deg) translateZ(30px)"></div>
+      <div class="face" style="transform: rotateY(180deg) translateZ(30px)"></div>
+      <div class="face" style="transform: rotateY(-90deg) translateZ(30px)"></div>
+      <div class="face top" style="transform: rotateX(90deg) translateZ(30px)"></div>
+      <div class="face bottom" style="transform: rotateX(-90deg) translateZ(130px)"></div>
+    </div></div>
+    <div class="label">Altitude: filter (blue) vs raw baro (grey), last 60 s</div>
+    <canvas id="altChart" width="600" height="140"></canvas>
+    <div class="label">Health checks</div><div id="checks"></div>
+  </div>
+
+  <div class="card">
+    <div class="label">Last health packet</div>
+    <pre id="health">waiting…</pre>
+  </div>
+</div>
+
+<script>
+// ---------- connection ----------
+const host = location.hostname || "localhost";
+document.getElementById("host").textContent = host;
+let ws, latestHealth = null;
+const altHist = [], baroHist = [];
+function connect() {
+  ws = new WebSocket(`ws://${host}:8765`);
+  ws.onopen = () => { const c = document.getElementById("conn"); c.textContent = "connected"; c.className = "ok"; };
+  ws.onclose = () => { const c = document.getElementById("conn"); c.textContent = "disconnected"; c.className = "bad"; setTimeout(connect, 1000); };
+  ws.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.type === "state") onState(m);
+    else if (m.type === "health") onHealth(m);
+    else if (m.type === "link") onLink(m);
+  };
+}
+connect();
+
+// ---------- state ----------
+function onState(s) {
+  document.getElementById("phase").textContent = s.phase_name;
+  document.getElementById("alt").textContent = s.alt_m.toFixed(1);
+  document.getElementById("vel").textContent = s.vel_mps.toFixed(1);
+  document.getElementById("flags").innerHTML = Object.entries(s.flags)
+    .map(([k, v]) => `<div class="row"><span>${k}</span><span class="${v ? "ok" : ""}">${v ? "●" : "○"}</span></div>`).join("");
+  // quaternion -> CSS matrix3d. Body +Z (nose) maps to screen up (CSS -Y).
+  const [w, x, y, z] = s.q;
+  const r = [
+    1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w),
+    2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w),
+    2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y)];
+  // ENU (x east, y north, z up) -> CSS (x right, y down, z toward viewer): swap y/z, flip y.
+  const m = `matrix3d(${r[0]},${-r[6]},${r[3]},0, ${r[1]},${-r[7]},${r[4]},0, ${r[2]},${-r[8]},${r[5]},0, 0,0,0,1)`;
+  document.getElementById("cube").style.transform = m;
+  const t = s.rx_time;
+  altHist.push([t, s.alt_m]); baroHist.push([t, s.baro_alt_m]);
+  while (altHist.length && t - altHist[0][0] > 60) { altHist.shift(); baroHist.shift(); }
+  drawChart();
+  runChecks(s, latestHealth);
+}
+
+// ---------- health ----------
+function onHealth(h) {
+  latestHealth = h;
+  document.getElementById("health").textContent = JSON.stringify(h, null, 1);
+}
+
+function onLink(l) {
+  const cls = l.last_rx_age_s == null ? "bad" : l.last_rx_age_s > 2 ? "bad" : "ok";
+  document.getElementById("link").innerHTML =
+    `<div class="row"><span>RSSI</span><span>${l.rssi_dbm ?? "—"} dBm</span></div>` +
+    `<div class="row"><span>SNR</span><span>${l.snr_db ?? "—"} dB</span></div>` +
+    `<div class="row"><span>rate</span><span>${l.state_rate_hz} Hz</span></div>` +
+    `<div class="row"><span>lost / bad</span><span>${l.state_lost} / ${l.bad_packets}</span></div>` +
+    `<div class="row"><span>last packet</span><span class="${cls}">${l.last_rx_age_s ?? "—"} s ago</span></div>`;
+}
+
+// ---------- simple sanity checks (tune thresholds to your vehicle) ----------
+function runChecks(s, h) {
+  const out = [];
+  const add = (ok, text, warn) => out.push(`<div class="${ok ? "ok" : warn ? "warn" : "bad"}">${ok ? "✓" : "✗"} ${text}</div>`);
+  if (h) {
+    const onPad = s.phase === 0;
+    const g = Math.hypot(...h.accel_mss);
+    if (onPad) add(Math.abs(g - 9.81) < 1.0, `pad |accel| = ${g.toFixed(2)} (expect ≈ 9.81)`);
+    if (onPad) add(Math.hypot(...h.gyro_rads) < 0.05, `pad gyro = ${Math.hypot(...h.gyro_rads).toFixed(3)} rad/s`);
+    add(h.sensor_hz >= 90, `sensor task ${h.sensor_hz} Hz`);
+    add(h.status.heartbeats_ok && h.status.watchdog_armed, "watchdog armed & heartbeats ok");
+    add(h.status.sd_logging, "SD logging");
+    add(h.gps_fix_type >= 3 && h.gps_sats >= 6, `GPS fix ${h.gps_fix_type}, ${h.gps_sats} sats`, true);
+    add(Math.abs(h.vf_baro_nis) < 3, `baro innovation ${h.vf_baro_nis.toFixed(2)} σ`, true);
+    add(!h.reset_was_watchdog, h.reset_was_watchdog ? `WATCHDOG RESET (restore #${h.restore_count})` : "no watchdog reset");
+    if (s.phase >= 1 && s.phase <= 3) add(h.backup_remaining_ms > 0 || s.flags.deployed, `backup timer ${(h.backup_remaining_ms/1000).toFixed(1)} s`, true);
+  }
+  add(Math.abs(s.alt_m - s.baro_alt_m) < 15, `filter vs baro Δ = ${(s.alt_m - s.baro_alt_m).toFixed(1)} m`, true);
+  const qn = Math.hypot(...s.q);
+  add(Math.abs(qn - 1) < 0.02, `|q| = ${qn.toFixed(3)}`);
+  document.getElementById("checks").innerHTML = out.join("");
+}
+
+// ---------- tiny chart ----------
+function drawChart() {
+  const c = document.getElementById("altChart"), ctx = c.getContext("2d");
+  ctx.clearRect(0, 0, c.width, c.height);
+  if (altHist.length < 2) return;
+  const t0 = altHist[0][0], t1 = altHist[altHist.length - 1][0];
+  const all = altHist.concat(baroHist).map(p => p[1]);
+  const lo = Math.min(...all), hi = Math.max(...all) + 1;
+  const X = t => (t - t0) / Math.max(t1 - t0, 1) * c.width;
+  const Y = v => c.height - (v - lo) / (hi - lo) * (c.height - 10) - 5;
+  const line = (pts, color) => { ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
+    pts.forEach(([t, v], i) => i ? ctx.lineTo(X(t), Y(v)) : ctx.moveTo(X(t), Y(v))); ctx.stroke(); };
+  line(baroHist, "#777"); line(altHist, "#6af");
+  ctx.fillStyle = "#888"; ctx.font = "11px sans-serif";
+  ctx.fillText(hi.toFixed(0) + " m", 4, 12); ctx.fillText(lo.toFixed(0) + " m", 4, c.height - 4);
+}
+</script>
+</body>
+</html>
